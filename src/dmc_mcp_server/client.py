@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-import os
 import time
 import uuid
+import threading
 from dataclasses import dataclass, field
-from typing import Optional
 
 import httpx
 
 from .crypto import encrypt_password
-
-for _k in ("ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "http_proxy", "https_proxy"):
-    os.environ.pop(_k, None)
-os.environ.setdefault("NO_PROXY", "*")
+from .sql_policy import validate_read_only, metadata_identifier, sql_literal
 
 DMC_BASE = "https://dms.cloud.tencent.com"
 SESSION_TOKEN_TTL = 7200
@@ -22,7 +18,7 @@ SESSION_TOKEN_TTL = 7200
 class InstanceCredentials:
     instance_id: str
     user: str
-    password: str
+    password: str = field(repr=False)
     db_type: str = "cynosdbmysql"
     region_id: int = 4
 
@@ -30,7 +26,7 @@ class InstanceCredentials:
 @dataclass
 class InstanceSession:
     credentials: InstanceCredentials
-    token: str
+    token: str = field(repr=False)
     logged_in_at: float = field(default_factory=time.time)
 
     @property
@@ -55,6 +51,7 @@ class SessionExpiredError(Exception):
 
 class DMCClient:
     def __init__(self, cookie: str, mc_gtk: int = 0):
+        self._lock = threading.RLock()
         self._cookie = cookie
         self._mc_gtk = mc_gtk
         self._sessions: dict[str, InstanceSession] = {}
@@ -78,9 +75,11 @@ class DMCClient:
         }
 
     def update_cookie(self, cookie: str, mc_gtk: int = 0):
-        self._cookie = cookie
-        if mc_gtk:
+        with self._lock:
+            self._cookie = cookie
             self._mc_gtk = mc_gtk
+            self._sessions.clear()
+            self._creds_registry.clear()
 
     def ensure_login(
         self,
@@ -90,22 +89,21 @@ class DMCClient:
         db_type: str = "cynosdbmysql",
         region_id: int = 4,
     ) -> InstanceSession:
-        creds = InstanceCredentials(
-            instance_id=instance_id,
-            user=user,
-            password=password,
-            db_type=db_type,
-            region_id=region_id,
-        )
-        self._creds_registry[instance_id] = creds
-
-        session = self._sessions.get(instance_id)
-        if session and not session.is_expired():
-            if self._ping(session):
-                return session
-            del self._sessions[instance_id]
-
-        return self._do_login(creds)
+        with self._lock:
+            creds = InstanceCredentials(
+                instance_id=instance_id,
+                user=user,
+                password=password,
+                db_type=db_type,
+                region_id=region_id,
+            )
+            session = self._sessions.get(instance_id)
+            if session and session.credentials == creds and not session.is_expired():
+                if self._ping(session):
+                    return session
+            self._sessions.pop(instance_id, None)
+            self._creds_registry.pop(instance_id, None)
+            return self._do_login(creds)
 
     def _do_login(self, creds: InstanceCredentials) -> InstanceSession:
         request_id = str(uuid.uuid4())
@@ -131,11 +129,12 @@ class DMCClient:
         if data.get("code") != 0:
             raise RuntimeError(
                 f"DMC login failed for '{creds.instance_id}': "
-                f"{data.get('msg', data)}"
+                "check the account and console session."
             )
 
         token = data["data"]["token"]
         session = InstanceSession(credentials=creds, token=token)
+        self._creds_registry[creds.instance_id] = creds
         self._sessions[creds.instance_id] = session
         return session
 
@@ -191,19 +190,23 @@ class DMCClient:
         page_size: int = 50,
         is_getting_count: int = 1,
     ) -> dict:
-        session = self._get_valid_session(instance_id)
+        with self._lock:
+            sql = validate_read_only(sql, allow_metadata=True)
+            if not 1 <= page_size <= 1000:
+                raise ValueError("page_size must be between 1 and 1000.")
+            session = self._get_valid_session(instance_id)
 
-        try:
-            return self._call_common_sql(
-                session, sql, db_name, page_size, is_getting_count
-            )
-        except SessionExpiredError:
-            del self._sessions[instance_id]
-            creds = self._creds_registry[instance_id]
-            session = self._do_login(creds)
-            return self._call_common_sql(
-                session, sql, db_name, page_size, is_getting_count
-            )
+            try:
+                return self._call_common_sql(
+                    session, sql, db_name, page_size, is_getting_count
+                )
+            except SessionExpiredError:
+                del self._sessions[instance_id]
+                creds = self._creds_registry[instance_id]
+                session = self._do_login(creds)
+                return self._call_common_sql(
+                    session, sql, db_name, page_size, is_getting_count
+                )
 
     def _call_common_sql(
         self,
@@ -240,7 +243,7 @@ class DMCClient:
                 raise SessionExpiredError(
                     f"Session expired for '{session.instance_id}'"
                 )
-            raise RuntimeError(f"SQL execution failed: {msg}")
+            raise RuntimeError("DMC rejected the query; inspect the DMS audit log for details.")
 
         return data["data"]
 
@@ -279,11 +282,10 @@ class DMCClient:
     def list_tables(
         self, instance_id: str, db_name: str, search: str | None = None
     ) -> list[dict]:
-        safe_db = db_name.replace("'", "''")
+        safe_db = metadata_identifier(db_name)
         where = f"WHERE TABLE_SCHEMA = '{safe_db}'"
         if search:
-            safe_search = search.replace("'", "''")
-            where += f" AND TABLE_NAME LIKE '%{safe_search}%'"
+            where += f" AND TABLE_NAME LIKE {sql_literal('%' + search + '%')}"
 
         sql = (
             f"SELECT TABLE_NAME, TABLE_ROWS, DATA_LENGTH, TABLE_COMMENT "
@@ -298,8 +300,8 @@ class DMCClient:
         self, instance_id: str, db_name: str, table_name: str,
         include_ddl: bool = False,
     ) -> dict:
-        safe_db = db_name.replace("'", "''")
-        safe_table = table_name.replace("'", "''")
+        safe_db = metadata_identifier(db_name)
+        safe_table = metadata_identifier(table_name)
 
         cols_sql = (
             f"SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, "

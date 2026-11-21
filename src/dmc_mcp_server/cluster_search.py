@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-import os
 import httpx
-
-for _k in ("ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "http_proxy", "https_proxy"):
-    os.environ.pop(_k, None)
-os.environ.setdefault("NO_PROXY", "*")
 
 CLUSTER_API = "https://cynosdb.cloud.tencent.com/api/cloud3/cynosdb/DescribeClusters"
 TDSQL_API = "https://tdsql.cloud.tencent.com/api/cloud3/tdsql/DescribeDCDBInstances"

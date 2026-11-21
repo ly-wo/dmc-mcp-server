@@ -1,138 +1,81 @@
 from __future__ import annotations
 
-import re
+import threading
+from functools import wraps
 
 from mcp.server.fastmcp import FastMCP
 
-from .client import DMCClient
-from .cookie_manager import CookieManager
+from .client import DMCClient, InstanceCredentials
+from .credentials import load_credentials
+from .sql_policy import validate_read_only
 
 mcp = FastMCP("dmc-mcp-server")
 
-_cookie_mgr = CookieManager()
 _client: DMCClient | None = None
+_profiles: dict[str, InstanceCredentials] = {}
+_state_lock = threading.RLock()
 
 
+def _serialize_auth(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _state_lock:
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+@_serialize_auth
 def _get_client() -> DMCClient:
-    global _client
     if _client is None:
-        if not _cookie_mgr.is_ready():
-            _cookie_mgr.load_from_env()
-        if not _cookie_mgr.is_ready():
-            raise RuntimeError(
-                "No cookie configured. Use the 'set_cookie' tool first, "
-                "or set the DMC_COOKIE environment variable."
-            )
-        _client = DMCClient(cookie=_cookie_mgr.cookie, mc_gtk=_cookie_mgr.mc_gtk)
+        reload_credentials()
+    assert _client is not None
     return _client
 
 
 def _validate_select_only(sql: str) -> str:
-    stripped = sql.strip().rstrip(";").strip()
+    return validate_read_only(sql)
 
-    forbidden_prefixes = [
-        "insert", "update", "delete", "drop", "create", "alter",
-        "truncate", "replace", "grant", "revoke", "lock", "unlock",
-        "call", "handler", "load", "outfile", "dumpfile", "kill",
-        "set", "do", "flush", "reset", "shutdown", "start", "stop",
-        "checkpoint", "purge", "optimize", "analyze", "check",
-        "repair", "backup", "restore", "clone", "install", "uninstall",
-        "xa", "begin", "commit", "rollback", "savepoint",
-    ]
-
-    first_word = stripped.split()[0].lower() if stripped.split() else ""
-
-    if first_word in forbidden_prefixes:
-        raise ValueError(
-            f"This MCP server only supports SELECT queries. "
-            f"Detected '{first_word.upper()}' which is not allowed."
-        )
-
-    select_pattern = re.compile(
-        r"^(with\s+.*?\)\s*select|select)\s",
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not select_pattern.match(stripped):
-        raise ValueError(
-            f"Only SELECT statements are allowed. "
-            f"Query must start with SELECT or WITH...SELECT."
-        )
-
-    return stripped
-
-
-# ============================================================
-# MCP Tools
-# ============================================================
 
 @mcp.tool()
-def set_cookie(cookie: str, mc_gtk: int = 0) -> str:
-    """
-    Set or update the Tencent Cloud console cookie.
-    AI can obtain this from the browser via Chrome DevTools MCP:
-      document.cookie
-    Then pass the full cookie string here.
+@_serialize_auth
+def reload_credentials() -> str:
+    """Reload the private local DMC_CREDENTIALS_FILE. No secret arguments.
 
-    The mc_gtk (csrfCode) value is required for cluster search (DescribeClusters API).
-    AI can extract it from the browser's performance API:
-      performance.getEntriesByType('resource')
-        .find(e => e.name.includes('csrfCode='))
-        ?.name.match(/csrfCode=(\\d+)/)?.[1]
-    If not provided, DMC login/SQL tools will still work (they don't require mc_gtk
-    to be valid), but find_instance_by_ip will fail.
-
-    Args:
-        cookie: Full cookie string from the Tencent Cloud console browser tab.
-        mc_gtk: Optional csrfCode value from the browser. Required for cluster search.
+    This clears all sessions, including on failure. Edit the file outside chat;
+    never paste cookies, passwords or tokens into a tool or conversation.
     """
-    _cookie_mgr.set_cookie(cookie, mc_gtk)
-    global _client
+    global _client, _profiles
     if _client is not None:
-        _client.update_cookie(_cookie_mgr.cookie, _cookie_mgr.mc_gtk)
-    else:
-        _client = DMCClient(cookie=_cookie_mgr.cookie, mc_gtk=_cookie_mgr.mc_gtk)
-    return "Cookie updated successfully. All active sessions will use the new cookie."
+        _client.update_cookie('', 0)
+        _client._http.close()
+    _client = None
+    _profiles = {}
+    try:
+        cookie, csrf, profiles = load_credentials()
+    except (OSError, ValueError):
+        raise ValueError('Cannot load private credentials. Check DMC_CREDENTIALS_FILE locally.') from None
+    _client = DMCClient(cookie=cookie, mc_gtk=csrf)
+    _profiles = profiles
+    return 'Credentials reloaded; all previous sessions cleared.'
 
 
 @mcp.tool()
-def login_instance(
-    instance_id: str,
-    user: str,
-    password: str,
-    db_type: str = "cynosdbmysql",
-    region_id: int = 4,
-) -> str:
-    """
-    Login to a database instance via Tencent Cloud DMC.
-    Supports both TDSQL-C (CynosDB) and TDSQL (DCDB) instances.
-    The session is cached - subsequent calls reuse the same token
-    without re-login, unless the token expires.
+@_serialize_auth
+def login_instance(profile: str) -> str:
+    """Log in using a profile alias from the private local credentials file.
 
-    Use find_instance_by_ip to discover the instance_id and db_type,
-    then pass the db_type value from the search results here.
-
-    Args:
-        instance_id: Instance ID, e.g. "cynosdbmysql-xxx" or "tdsqlshard-xxx"
-        user: Database account name, e.g. "db_user"
-        password: Database account password (plain text)
-        db_type: Database type - "cynosdbmysql" (TDSQL-C) or "tdsql" (TDSQL)
-        region_id: Region ID, default 4 (Shanghai)
-
-    Returns:
-        Login status message.
+    Profile credentials must belong to a database account with read-only grants.
+    Passwords and console cookies must never be supplied as tool arguments.
     """
     client = _get_client()
-    session = client.ensure_login(
-        instance_id=instance_id,
-        user=user,
-        password=password,
-        db_type=db_type,
-        region_id=region_id,
+    creds = _profiles.get(profile)
+    if creds is None:
+        raise ValueError('Unknown local credentials profile.')
+    client.ensure_login(
+        instance_id=creds.instance_id, user=creds.user, password=creds.password,
+        db_type=creds.db_type, region_id=creds.region_id,
     )
-    return (
-        f"Login successful. Instance: {instance_id}, "
-        f"User: {user}, Token prefix: {session.token[:16]}..."
-    )
+    return f'Login successful. Instance: {creds.instance_id}, User: {creds.user}'
 
 
 @mcp.tool()
@@ -263,7 +206,7 @@ def get_table_detail(
         Column details (and CREATE TABLE DDL if include_ddl=True).
     """
     client = _get_client()
-    detail = client.get_table_detail(instance_id, db_name, table_name)
+    detail = client.get_table_detail(instance_id, db_name, table_name, include_ddl=include_ddl)
 
     columns = detail["columns"]
     lines = [f"Table: {db_name}.{table_name} ({len(columns)} columns)\n"]
@@ -317,7 +260,7 @@ def find_instance_by_ip(ip: str, region: str = "ap-shanghai") -> str:
     Typical workflow:
       1. Read the JDBC URL from your config file (e.g. 10.0.0.1:3306)
       2. Call find_instance_by_ip("10.0.0.1", region="ap-guangzhou") to get the InstanceId
-      3. Call login_instance with the InstanceId (use the DbType from results, and match region_id)
+      3. Configure a private local profile and call login_instance with its alias
       4. Call execute_select
 
     Args:
@@ -333,8 +276,9 @@ def find_instance_by_ip(ip: str, region: str = "ap-shanghai") -> str:
     except ImportError:
         return "Cluster search module not available."
 
-    cookie = _cookie_mgr.cookie
-    mc_gtk = _cookie_mgr.mc_gtk
+    client = _get_client()
+    cookie = client._cookie
+    mc_gtk = client._mc_gtk
     results = search_all_by_ip(cookie, ip, mc_gtk=mc_gtk, region=region)
     if not results:
         return f"No instance found with Vip '{ip}' in either TDSQL-C or TDSQL."
@@ -355,8 +299,6 @@ def find_instance_by_ip(ip: str, region: str = "ap-shanghai") -> str:
 
 
 def main():
-    _cookie_mgr.load_from_env()
-    _cookie_mgr.load_mc_gtk_from_env()
     mcp.run()
 
 

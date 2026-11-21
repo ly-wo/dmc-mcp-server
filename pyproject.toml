@@ -24,9 +24,10 @@ classifiers = [
     "Topic :: Database",
 ]
 dependencies = [
-    "mcp[cli]>=1.9.0",
+    "mcp[cli]>=1.30.0,<2",
     "httpx>=0.28.0",
     "pycryptodome>=3.20.0",
+    "sqlglot==30.8.0",
 ]
 
 [project.urls]
